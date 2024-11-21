@@ -1,13 +1,13 @@
 from abc import abstractmethod, ABC
 from argparse import ArgumentParser
 from collections import defaultdict
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from functools import total_ordering
 import itertools
 import math
 from operator import add as op_add
 import os
-from typing import Sequence, Optional, Any, Union, Callable, Iterable
+from typing import Optional, Any, Union, Callable, Iterable
 
 try:
     from typing import Self
@@ -17,10 +17,12 @@ except ImportError:
 import findspark
 findspark.init()
 
+import numpy as np
 from pyspark import SparkContext
 from pyspark.broadcast import Broadcast
 from pyspark.rdd import RDD
 from scipy.spatial.distance import euclidean
+from sklearn.cluster import KMeans
 
 
 class DistanceMeasure(ABC):
@@ -55,6 +57,7 @@ class Point:
     distanceFromOrigin: float
     precomputedNumberOfNeighbors: int
     clusterId: ClusterId
+    isSampled: bool
 
     def __init__(
         self, 
@@ -63,7 +66,8 @@ class Point:
         boxId: BoxId = 0,
         distanceFromOrigin: float = 0.0,
         precomputedNumberOfNeighbors: int = 0,
-        clusterId: ClusterId = DBSCAN_CLUSTER_UNDEF
+        clusterId: ClusterId = DBSCAN_CLUSTER_UNDEF,
+        isSampled: bool = True
     ) -> None:
         self.coordinates = coordinates
         self.pointId = pointId
@@ -71,6 +75,7 @@ class Point:
         self.distanceFromOrigin = distanceFromOrigin
         self.precomputedNumberOfNeighbors = precomputedNumberOfNeighbors
         self.clusterId = clusterId
+        self.isSampled = isSampled
 
     @classmethod
     def fromArray(cls, coords: Sequence[float]) -> Self:
@@ -80,7 +85,7 @@ class Point:
     def fromPoint(cls, pt: Self) -> Self:
         return cls(
             pt.coordinates, pt.pointId, pt.boxId, pt.distanceFromOrigin,
-            pt.precomputedNumberOfNeighbors, pt.clusterId
+            pt.precomputedNumberOfNeighbors, pt.clusterId, pt.isSampled
         )
 
     @classmethod
@@ -90,31 +95,37 @@ class Point:
     def withPointId(self, newId: PointId) -> Self:
         return Point(
             self.coordinates, newId, self.boxId, self.distanceFromOrigin,
-            self.precomputedNumberOfNeighbors, self.clusterId
+            self.precomputedNumberOfNeighbors, self.clusterId, self.isSampled
         )
 
     def withBoxId(self, newBoxId: BoxId) -> Self:
         return Point(
             self.coordinates, self.pointId, newBoxId, self.distanceFromOrigin,
-            self.precomputedNumberOfNeighbors, self.clusterId
+            self.precomputedNumberOfNeighbors, self.clusterId, self.isSampled
         )
 
     def withDistanceFromOrigin(self, newDistance: float) -> Self:
         return Point(
             self.coordinates, self.pointId, self.boxId, newDistance,
-            self.precomputedNumberOfNeighbors, self.clusterId
+            self.precomputedNumberOfNeighbors, self.clusterId, self.isSampled
         )
 
     def withNumberOfNeighbors(self, newNumber: int) -> Self:
         return Point(
             self.coordinates, self.pointId, self.boxId, self.distanceFromOrigin,
-            newNumber, self.clusterId
+            newNumber, self.clusterId, self.isSampled
         )
 
     def withClusterId(self, newId: ClusterId) -> Self:
         return Point(
             self.coordinates, self.pointId, self.boxId, self.distanceFromOrigin,
-            self.precomputedNumberOfNeighbors, newId
+            self.precomputedNumberOfNeighbors, newId, self.isSampled
+        )
+
+    def withSampling(self, newIsSampled: bool) -> Self:
+        return Point(
+            self.coordinates, self.pointId, self.boxId, self.distanceFromOrigin,
+            self.precomputedNumberOfNeighbors, self.clusterId, newIsSampled
         )
 
     def __eq__(self, other: Any) -> bool:
@@ -148,18 +159,24 @@ class DbscanSettings:
     treatBorderPointsAsNoise: bool
     epsilon: float
     numberOfPoints: int
+    samplingFraction: float
+    samplingStrategy: str
 
     # Static
     defaultDistanceMeasure: DistanceMeasure = EuclideanDistance()
     defaultTreatmentOfBorderPoints: bool = False
     defaultEpsilon: float = 1e-4
     defaultNumberOfPoints: int = 3
+    defaultSamplingFraction: float = 0.5
+    defaultSamplingStrategy: str = 'linspace'
     
     def __init__(self) -> None:
         self.distanceMeasure = self.defaultDistanceMeasure
         self.treatBorderPointsAsNoise = self.defaultTreatmentOfBorderPoints
         self.epsilon = self.defaultEpsilon
         self.numberOfPoints = self.defaultNumberOfPoints
+        self.samplingFraction = self.defaultSamplingFraction
+        self.samplingStrategy = self.defaultSamplingStrategy
 
     def withDistanceMeasure(self, dm: DistanceMeasure) -> Self:
         self.distanceMeasure = dm
@@ -175,6 +192,14 @@ class DbscanSettings:
 
     def withNumberOfPoints(self, np: int) -> Self:
         self.numberOfPoints = np
+        return self
+
+    def withSamplingFraction(self, frac: float) -> Self:
+        self.samplingFraction = frac
+        return self
+
+    def withSamplingStrategy(self, strat: str) -> Self:
+        self.samplingStrategy = strat
         return self
 
 
@@ -804,6 +829,7 @@ class PointIndexer:
                     distanceFromOrigin,
                     pt.precomputedNumberOfNeighbors,
                     pt.clusterId,
+                    pt.isSampled,
                 )
                 result.append((PointSortKey(newPoint), newPoint))
             return result
@@ -1188,8 +1214,9 @@ class DistanceAnalyzer(DistanceCalculation):
         partitionIndex.populate(pt[1] for pt in it1)
 
         for currentPoint in it2:
-            closePointsCount = sum(1 for _ in partitionIndex.findClosePoints(currentPoint[1]))
-            counts[currentPoint[0]] += closePointsCount
+            if currentPoint[1].isSampled:
+                closePointsCount = sum(1 for _ in partitionIndex.findClosePoints(currentPoint[1]))
+                counts[currentPoint[0]] += closePointsCount
 
         return counts.items()
 
@@ -1217,15 +1244,17 @@ class DistanceAnalyzer(DistanceCalculation):
 
             for i in range(1, len(pointsInPartition)):
                 pi = pointsInPartition[i]
+                piIsSampled = pi.isSampled
                 piSortKey = PointSortKey(pi)
                 for j in range(i - 1, -1, -1):
                     pj = pointsInPartition[j]
                     if pi.distanceFromOrigin - pj.distanceFromOrigin > eps:
                         break
 
-                    if pi.boxId != pj.boxId and f_calculatePointDistance(pi, pj, distanceMeasure) <= self_eps:
-                        counts[piSortKey] += 1
-                        counts[PointSortKey(pj)] += 1
+                    pjIsSampled = pj.isSampled
+                    if (piIsSampled or pjIsSampled) and pi.boxId != pj.boxId and f_calculatePointDistance(pi, pj, distanceMeasure) <= self_eps:
+                        if piIsSampled: counts[piSortKey] += 1
+                        if pjIsSampled: counts[PointSortKey(pj)] += 1
 
             return counts.items()
 
@@ -1290,6 +1319,9 @@ class Args:
     # Args
     minPts: int
     borderPointsAsNoise: bool
+    # DBSCAN++
+    samplingFraction: float
+    samplingStrategy: str
     
     def __init__(
         self,
@@ -1303,7 +1335,9 @@ class Args:
         eps: float = DbscanSettings.defaultEpsilon,
         numberOfPoints: int = PartitioningSettings.defaultNumberOfPointsInBox,
         minPts: int = DbscanSettings.defaultNumberOfPoints,
-        borderPointsAsNoise: bool = DbscanSettings.defaultTreatmentOfBorderPoints
+        borderPointsAsNoise: bool = DbscanSettings.defaultTreatmentOfBorderPoints,
+        samplingFraction: float = DbscanSettings.defaultSamplingFraction,
+        samplingStrategy: str = DbscanSettings.defaultSamplingStrategy
     ) -> None:
         self.masterUrl = masterUrl
         self.pyFiles = pyFiles
@@ -1315,6 +1349,8 @@ class Args:
         self.numberOfPoints = numberOfPoints
         self.minPts = minPts
         self.borderPointsAsNoise = borderPointsAsNoise
+        self.samplingFraction = samplingFraction
+        self.samplingStrategy = samplingStrategy
 
 
 class ArgsParser:
@@ -1342,6 +1378,12 @@ class ArgsParser:
         self._parser.add_argument('--borderPointsAsNoise', action='store_true',
                                 help='A flag indicating whether border points should be treated as noise')
 
+        # DBSCAN++-specific arguments
+        self._parser.add_argument('--samplingFraction', type=float, default=0.5,
+                                  help='Fraction of points to sample for core points (default: 0.5)')
+        self._parser.add_argument('--samplingStrategy', type=str, choices=['linspace', 'uniform', 'kmeanspp'], default='linspace',
+                                  help='Sampling strategy for core points (default: linspace)')
+
     def parse(self):
         namespace = self._parser.parse_args()
 
@@ -1365,6 +1407,10 @@ class ArgsParser:
         self.args.numberOfPoints = namespace.npp
         self.args.minPts = namespace.numPts
         self.args.borderPointsAsNoise = namespace.borderPointsAsNoise
+
+        # DBSCAN++-specific arguments
+        self.args.samplingFraction = namespace.samplingFraction
+        self.args.samplingStrategy = namespace.samplingStrategy
 
         return namespace
 
@@ -1411,7 +1457,7 @@ class PartiallyMutablePoint(Point):
     visited: bool
 
     def __init__(self, p: Point, tempId: TempPointId) -> None:
-        super().__init__(p.coordinates, p.pointId, p.boxId, p.distanceFromOrigin, p.precomputedNumberOfNeighbors, p.clusterId)
+        super().__init__(p.coordinates, p.pointId, p.boxId, p.distanceFromOrigin, p.precomputedNumberOfNeighbors, p.clusterId, p.isSampled)
         self.tempId = tempId
         self.transientClusterId = p.clusterId
         self.visited = False
@@ -1459,6 +1505,8 @@ class DistributedDbscan(Dbscan, DistanceCalculation):
             ).saveAsTextFile(path),
         )
 
+        partitionedData.rdd = self._sampleCorePointsPerPartition(partitionedData.rdd)
+
         pointsWithNeighborCounts = distanceAnalyzer.countNeighborsForEachPoint(partitionedData)
         broadcastBoxes = data.context.broadcast(partitionedData.boxes)
 
@@ -1493,6 +1541,69 @@ class DistributedDbscan(Dbscan, DistanceCalculation):
 
         return DbscanModel(completelyClusteredData, self.settings)
 
+    def _sampleCorePointsPerPartition(self, data: RDD[tuple[PointSortKey, Point]]) -> RDD[tuple[PointSortKey, Point]]:
+        frac = self.settings.samplingFraction
+        if frac >= 1.0:
+            return data
+
+        broadcastFrac = data.context.broadcast(frac)
+
+        def samplePartition_Uniform(it: Iterable[tuple[PointSortKey, Point]]) -> Iterable[tuple[PointSortKey, Point]]:
+            partitionData = it
+            if not isinstance(partitionData, Sequence):
+                partitionData = tuple(partitionData)
+            size = len(partitionData)
+            if size == 0:
+                yield from ()
+
+            sampleSize = min(max(math.ceil(size * broadcastFrac.value), 1), size)
+            subsetIndices = np.sort(np.random.choice(np.arange(size), sampleSize, replace=False))
+
+            for i, x in enumerate(partitionData):
+                yield (x[0], x[1].withSampling(i in subsetIndices))
+
+        def samplePartition_Linspace(it: Iterable[tuple[PointSortKey, Point]]) -> Iterable[tuple[PointSortKey, Point]]:
+            partitionData = it
+            if not isinstance(partitionData, Sequence):
+                partitionData = tuple(partitionData)
+            size = len(partitionData)
+            if size == 0:
+                yield from ()
+
+            sampleSize = min(max(math.ceil(size * broadcastFrac.value), 1), size)
+            subsetIndices = np.linspace(0, size - 1, sampleSize, dtype=int)
+
+            for i, x in enumerate(partitionData):
+                yield (x[0], x[1].withSampling(i in subsetIndices))
+
+        f_computeDistance = self.distanceMeasure.compute
+
+        def samplePartition_KMeansPP(it: Iterable[tuple[PointSortKey, Point]]) -> Iterable[tuple[PointSortKey, Point]]:
+            partitionData = it
+            if not isinstance(partitionData, Sequence):
+                partitionData = tuple(partitionData)
+            size = len(partitionData)
+            if size == 0:
+                yield from ()
+
+            dataPoints = np.array([x[1].coordinates for x in partitionData])
+
+            sampleSize = min(max(math.ceil(size * broadcastFrac.value), 1), size)
+            kmeans = KMeans(n_clusters=sampleSize, init="k-means++", random_state=42).fit(dataPoints)
+            subsetIndices = set(np.argmin([f_computeDistance(point, center) for point in dataPoints]) for center in kmeans.cluster_centers_)
+
+            for i, x in enumerate(partitionData):
+                yield (x[0], x[1].withSampling(i in subsetIndices))
+
+        if self.settings.samplingStrategy == 'uniform':
+            return data.mapPartitions(samplePartition_Uniform, preservesPartitioning=True)
+
+        elif self.settings.samplingStrategy == 'kmeanspp':
+            return data.mapPartitions(samplePartition_KMeansPP, preservesPartitioning=True)
+
+        else:  # self.settings.samplingStrategy == 'linspace'
+            return data.mapPartitions(samplePartition_Linspace, preservesPartitioning=True)
+
     @classmethod
     def _findClustersInOnePartition(cls, it: Iterable[tuple[PointSortKey, Point]], boundingBox: Box, distanceMeasure: DistanceMeasure, settings: DbscanSettings, partitioningSettings: PartitioningSettings) -> Iterator[tuple[PointSortKey, Point]]:
         points = {1+tempPointId: PartiallyMutablePoint(x[1], 1+tempPointId) for tempPointId, x in enumerate(it)}
@@ -1524,7 +1635,7 @@ class DistributedDbscan(Dbscan, DistanceCalculation):
             for n in neighbors:
                 n.visited = True
 
-                if n.precomputedNumberOfNeighbors >= settings.numberOfPoints:
+                if n.isSampled and n.precomputedNumberOfNeighbors >= settings.numberOfPoints:
                     n.transientClusterId = startingPoint.transientClusterId
                     assert n.tempId != currentPointId
                     corePointsInCluster.add(n.tempId)
@@ -1545,13 +1656,13 @@ class DistributedDbscan(Dbscan, DistanceCalculation):
 
     @staticmethod
     def _findUnvisitedCorePoint(points: dict[TempPointId, PartiallyMutablePoint], settings: DbscanSettings) -> Optional[tuple[TempPointId, PartiallyMutablePoint]]:
-        return next((pt for pt in points.items() if not pt[1].visited and pt[1].precomputedNumberOfNeighbors >= settings.numberOfPoints), None)
+        return next((pt for pt in points.items() if not pt[1].visited and pt[1].isSampled and pt[1].precomputedNumberOfNeighbors >= settings.numberOfPoints), None)
 
     def _mergeClustersFromDifferentPartitions(self, partiallyClusteredData: RDD[tuple[PointSortKey, Point]], boxes: Iterable[Box]) -> RDD[Point]:
         distanceAnalyzer = DistanceAnalyzer(self.settings)
         pointsCloseToBoxBounds = distanceAnalyzer.findPointsCloseToBoxBounds(
             partiallyClusteredData, boxes, self.settings.epsilon
-        )
+        ).filter(lambda pt: pt.isSampled)
 
         DebugHelper.doAndSaveResult(
             partiallyClusteredData.context,
@@ -1596,9 +1707,12 @@ class DistributedDbscan(Dbscan, DistanceCalculation):
 
             for i in range(1, len(pointsInPartition)):
                 pi = pointsInPartition[i]
+                assert pi.isSampled
 
                 for j in range(i - 1, -1, -1):
                     pj = pointsInPartition[j]
+                    assert pj.isSampled
+
                     if pi.distanceFromOrigin - pj.distanceFromOrigin > settings.epsilon:
                         break
 
@@ -1630,9 +1744,12 @@ class DistributedDbscan(Dbscan, DistanceCalculation):
 
                 for i in range(1, len(pointsInPartition)):
                     pi = pointsInPartition[i]
+                    assert pi.isSampled
 
                     for j in range(i - 1, -1, -1):
                         pj = pointsInPartition[j]
+                        assert pj.isSampled
+
                         if pi.distanceFromOrigin - pj.distanceFromOrigin > settings.epsilon:
                             break
 
@@ -1747,7 +1864,7 @@ class DistributedDbscan(Dbscan, DistanceCalculation):
 
     @staticmethod
     def isCorePoint(pt: Point, settings: DbscanSettings) -> bool:
-        return pt.precomputedNumberOfNeighbors >= settings.numberOfPoints
+        return pt.isSampled and pt.precomputedNumberOfNeighbors >= settings.numberOfPoints
 
     @classmethod
     def train(
