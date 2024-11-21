@@ -12,7 +12,7 @@ def main():
     builder: SparkSession.Builder = SparkSession.builder
     spark = builder \
         .master(args.masterUrl) \
-        .appName("DBSCAN") \
+        .appName("DBSCANPP") \
         .config("spark.files", args.pyFiles) \
         .getOrCreate()
 
@@ -23,6 +23,8 @@ def main():
     settings = DbscanSettings() \
         .withEpsilon(args.eps) \
         .withNumberOfPoints(args.minPts) \
+        .withSamplingFraction(args.samplingFraction) \
+        .withSamplingStrategy(args.samplingStrategy) \
         .withTreatBorderPointsAsNoise(args.borderPointsAsNoise) \
         .withDistanceMeasure(args.distanceMeasure)
 
