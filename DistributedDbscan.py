@@ -1547,6 +1547,7 @@ class DistributedDbscan(Dbscan, DistanceCalculation):
             return data
 
         broadcastFrac = data.context.broadcast(frac)
+        f_computeDistance = self.distanceMeasure.compute
 
         def samplePartition_Uniform(it: Iterable[tuple[PointSortKey, Point]]) -> Iterable[tuple[PointSortKey, Point]]:
             partitionData = it
@@ -1575,8 +1576,6 @@ class DistributedDbscan(Dbscan, DistanceCalculation):
 
             for i, x in enumerate(partitionData):
                 yield (x[0], x[1].withSampling(i in subsetIndices))
-
-        f_computeDistance = self.distanceMeasure.compute
 
         def samplePartition_KCenters(it: Iterable[tuple[PointSortKey, Point]]) -> Iterable[tuple[PointSortKey, Point]]:
             partitionData = it
