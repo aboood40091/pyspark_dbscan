@@ -1381,7 +1381,7 @@ class ArgsParser:
         # DBSCAN++-specific arguments
         self._parser.add_argument('--samplingFraction', type=float, default=0.5,
                                   help='Fraction of points to sample for core points (default: 0.5)')
-        self._parser.add_argument('--samplingStrategy', type=str, choices=['linspace', 'uniform', 'kmeanspp'], default='linspace',
+        self._parser.add_argument('--samplingStrategy', type=str, choices=['linspace', 'uniform', 'kcenters', 'kmeanspp'], default='linspace',
                                   help='Sampling strategy for core points (default: linspace)')
 
     def parse(self):
@@ -1578,6 +1578,43 @@ class DistributedDbscan(Dbscan, DistanceCalculation):
 
         f_computeDistance = self.distanceMeasure.compute
 
+        def samplePartition_KCenters(it: Iterable[tuple[PointSortKey, Point]]) -> Iterable[tuple[PointSortKey, Point]]:
+            partitionData = it
+            if not isinstance(partitionData, Sequence):
+                partitionData = tuple(partitionData)
+            size = len(partitionData)
+            if size == 0:
+                yield from ()
+
+            dataPoints = np.array([x[1].coordinates for x in partitionData])
+
+            sampleSize = min(max(math.ceil(size * broadcastFrac.value), 1), size)
+            subsetIndices = np.empty(sampleSize, dtype=np.int_)
+
+            # Initialize the first center to index 0
+            centerId = 0
+            subsetIndices[0] = centerId
+
+            # Precompute squared norms of all points
+            normsSq = np.einsum('ij,ij->i', dataPoints, dataPoints)
+
+            # Compute squared distances from all points to the first center
+            closestDistSq = normsSq + normsSq[centerId] - 2 * np.dot(dataPoints, dataPoints[centerId])
+
+            for c in range(1, sampleSize):
+                # Select the point that is farthest from its closest center
+                centerId = np.argmax(closestDistSq)
+                subsetIndices[c] = centerId
+
+                # Compute squared distances from all points to the new center
+                distSqNewCenter = normsSq + normsSq[centerId] - 2 * np.dot(dataPoints, dataPoints[centerId])
+
+                # Update closest distances
+                np.minimum(closestDistSq, distSqNewCenter, out=closestDistSq)
+
+            for i, x in enumerate(partitionData):
+                yield (x[0], x[1].withSampling(i in subsetIndices))
+
         def samplePartition_KMeansPP(it: Iterable[tuple[PointSortKey, Point]]) -> Iterable[tuple[PointSortKey, Point]]:
             partitionData = it
             if not isinstance(partitionData, Sequence):
@@ -1597,6 +1634,9 @@ class DistributedDbscan(Dbscan, DistanceCalculation):
 
         if self.settings.samplingStrategy == 'uniform':
             return data.mapPartitions(samplePartition_Uniform, preservesPartitioning=True)
+
+        elif self.settings.samplingStrategy == 'kcenters':
+            return data.mapPartitions(samplePartition_KCenters, preservesPartitioning=True)
 
         elif self.settings.samplingStrategy == 'kmeanspp':
             return data.mapPartitions(samplePartition_KMeansPP, preservesPartitioning=True)
