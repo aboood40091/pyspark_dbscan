@@ -1132,7 +1132,7 @@ class DistanceAnalyzer(DistanceCalculation):
             .repartitionAndSortWithinPartitions(partitioner.numPartitions, partitioner.getPartition)
         )
 
-        sortedData: RDD[tuple[PointSortKey, Point]] = data.rdd.sortByKey()
+        sortedData: RDD[tuple[PointSortKey, Point]] = data.rdd.mapPartitions(lambda it: sorted(it, key=lambda x: x[0]), preservesPartitioning=True)
 
         def f_map(x: tuple[tuple[PointSortKey, Point], tuple[PointSortKey, int]]) -> tuple[PointSortKey, Point]:
             assert x[0][0].pointId == x[1][0].pointId
@@ -1374,8 +1374,8 @@ class IOHelper:
     separator = ","
 
     @classmethod
-    def readDataset(cls, sc: SparkContext, path: str) -> RawDataSet:
-        rawData = sc.textFile(path)
+    def readDataset(cls, sc: SparkContext, path: str, minPartitions: Optional[int] = None) -> RawDataSet:
+        rawData = sc.textFile(path, minPartitions=minPartitions)
         return rawData.map(lambda line: Point(list(map(float, line.split(cls.separator)))))
 
     @classmethod
@@ -1644,7 +1644,7 @@ class DistributedDbscan(Dbscan, DistanceCalculation):
 
                 return bp.items()
 
-            borderPointsToBeAssignedToClusters = dict(pointsInAdjacentBoxes.mapPartitions(_mapParitions_borderPoints).collect())
+            borderPointsToBeAssignedToClusters = pointsInAdjacentBoxes.mapPartitions(_mapParitions_borderPoints).collectAsMap()
         else:
             borderPointsToBeAssignedToClusters: dict[PointId, ClusterId] = {}
 
