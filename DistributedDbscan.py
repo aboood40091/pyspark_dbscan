@@ -19,11 +19,12 @@ findspark.init()
 
 from pyspark import SparkContext
 from pyspark.broadcast import Broadcast
-from pyspark.rdd import RDD
+from pyspark.rdd import RDD, portable_hash
 from scipy.spatial.distance import euclidean
 
 
 class DistanceMeasure(ABC):
+    @staticmethod
     @abstractmethod
     def compute(a: Sequence[float], b: Sequence[float]) -> float:
         return 0.0
@@ -35,7 +36,7 @@ class EuclideanDistance(DistanceMeasure):
         return euclidean(a, b)
 
 
-PointCoordinates = list[float]
+PointCoordinates = tuple[float, ...]
 PointId = int
 TempPointId = int
 BoxId = int
@@ -74,7 +75,7 @@ class Point:
 
     @classmethod
     def fromArray(cls, coords: Sequence[float]) -> Self:
-        return cls(PointCoordinates(coords))
+        return cls(tuple(coords))
 
     @classmethod
     def fromPoint(cls, pt: Self) -> Self:
@@ -85,7 +86,7 @@ class Point:
 
     @classmethod
     def fromVariadic(cls, *coords: float) -> Self:
-        return cls(PointCoordinates(coords))
+        return cls(tuple(coords))
 
     def withPointId(self, newId: PointId) -> Self:
         return Point(
@@ -133,7 +134,7 @@ class Point:
         return NotImplemented
 
     def __hash__(self) -> int:
-        return hash(self.coordinates)
+        return portable_hash(self.coordinates)
 
     def __str__(self) -> str:
         return (f"Point at ({', '.join(map(str, self.coordinates))}); id = {self.pointId}; "
@@ -189,7 +190,8 @@ class BoundsInOneDimension:
         self.includeHigherBound = includeHigherBound
 
     def isNumberWithin(self, n: float) -> bool:
-        return (n >= self.lower) and ((n < self.upper) or (self.includeHigherBound and n <= self.upper))
+        n_ = DoubleComparisonOperations(n)
+        return (n_ >= self.lower) and ((n < self.upper) or (self.includeHigherBound and n_ <= self.upper))
 
     def split(self, n: int, dbscanSettingsOrMinLen: Optional[Union[DbscanSettings, float]] = None) -> list[Self]:
         if dbscanSettingsOrMinLen is not None:
@@ -267,13 +269,13 @@ class DoubleComparisonOperations:
     def __init__(self, originalValue: float) -> None:
         self.originalValue = originalValue
 
-    def __eq__(self, other: float) -> bool:
+    def __eq__(self, other: Any) -> bool:
         return self.isAlmostEqual(self.originalValue, other)
 
-    def __ge__(self, other: float) -> bool:
+    def __ge__(self, other: Any) -> bool:
         return (self.originalValue > other) or self.isAlmostEqual(self.originalValue, other)
 
-    def __le__(self, other: float) -> bool:
+    def __le__(self, other: Any) -> bool:
         return (self.originalValue < other) or self.isAlmostEqual(self.originalValue, other)
 
     @classmethod
@@ -300,6 +302,7 @@ class Box:
     boxId: BoxId
     partitionId: int
     adjacentBoxes: list[Self]
+    centerPoint: Point
 
     def __init__(
         self,
@@ -378,11 +381,11 @@ class Box:
         return foundBound, idx
 
     def calculateCenter(self, bounds: list[BoundsInOneDimension]) -> Point:
-        centerCoordinates = [b.lower + (b.upper - b.lower) / 2 for b in bounds]
+        centerCoordinates = tuple(b.lower + (b.upper - b.lower) / 2 for b in bounds)
         return Point(centerCoordinates)
 
     def addAdjacentBox(self, box: Self) -> None:
-        self.adjacentBoxes.append(box)
+        self.adjacentBoxes = [box] + self.adjacentBoxes
 
     def __eq__(self, other: Any) -> bool:
         if isinstance(other, Box):
@@ -539,13 +542,14 @@ class BoxPartitioner:
 
     def getPartition(self, key: Any) -> int:
         if isinstance(key, (Point, PointSortKey)):
-            return self.boxIdsToPartitions.get(key.boxId, 0)
+            return self.boxIdsToPartitions[key.boxId]
         elif isinstance(key, BoxId):
-            return self.boxIdsToPartitions.get(key, 0)
+            return self.boxIdsToPartitions[key]
         else:
-            return 0  # throw an exception?
+            raise KeyError(f'Excepted key of type {Point}, {PointSortKey}, or {BoxId}, got {type(key)}')
 
-    def _generateBoxIdsToPartitionsMap(self, boxes: Sequence[Box]) -> dict[BoxId, int]:
+    @staticmethod
+    def _generateBoxIdsToPartitionsMap(boxes: Sequence[Box]) -> dict[BoxId, int]:
         return {box.boxId: box.partitionId for box in boxes}
 
     @staticmethod
@@ -570,7 +574,7 @@ class BoxTreeItemBase:
         return [item.box for item in self.flatten]
 
     def flattenBoxesWithPredicate(self, predicate: Callable[[Self], bool]) -> list[Box]:
-        result = []
+        result: list[Box] = []
         self._flattenBoxes(predicate, result)
         return result
 
@@ -623,7 +627,7 @@ class BoxCalculator:
             lambda it: f_countPointsInOnePartition(broadcastBoxTree.value.clone(), it)
         )
 
-        totalCounts = partialCounts.foldByKey(0, op_add).collectAsMap()
+        totalCounts = partialCounts.reduceByKeyLocally(op_add)
         numberOfPointsInBox = partitioningSettings.numberOfPointsInBox
         boxesWithEnoughPoints = boxTree.flattenBoxesWithPredicate(
             lambda x: totalCounts[x.box.boxId] >= numberOfPointsInBox
@@ -633,7 +637,8 @@ class BoxCalculator:
 
         return BoxPartitioner.assignPartitionIdsToBoxes(boxesWithEnoughPoints), rootBox
 
-    def _getNumberOfDimensions(self, ds: RawDataSet) -> int:
+    @staticmethod
+    def _getNumberOfDimensions(ds: RawDataSet) -> int:
         pt = ds.first()
         return len(pt.coordinates)
 
@@ -641,22 +646,24 @@ class BoxCalculator:
     def calculateBoundingBox(self) -> Box:
         return Box(self._calculateBounds(self.data, self.numberOfDimensions))
 
-    def _calculateBounds(self, ds: RawDataSet, dimensions: int) -> list[BoundsInOneDimension]:
-        minPoint = Point([float( 'inf')] * dimensions)
-        maxPoint = Point([float('-inf')] * dimensions)
+    @classmethod
+    def _calculateBounds(cls, ds: RawDataSet, dimensions: int) -> list[BoundsInOneDimension]:
+        minPoint = Point((float( 'inf'),) * dimensions)
+        maxPoint = Point((float('-inf'),) * dimensions)
 
-        mins = self._fold(ds, minPoint, lambda x: min(x[0], x[1]))
-        maxs = self._fold(ds, maxPoint, lambda x: max(x[0], x[1]))
+        mins = cls._fold(ds, minPoint, lambda x: min(x[0], x[1]))
+        maxs = cls._fold(ds, maxPoint, lambda x: max(x[0], x[1]))
 
         return [
             BoundsInOneDimension(minCoord, maxCoord, True)
             for minCoord, maxCoord in zip(mins.coordinates, maxs.coordinates)
         ]
 
-    def _fold(self, ds: RawDataSet, zeroValue: Point, mapFunction: Callable[[tuple[float, float]], float]) -> Point:
-        return ds.fold(zeroValue, lambda pt1, pt2: Point([
+    @staticmethod
+    def _fold(ds: RawDataSet, zeroValue: Point, mapFunction: Callable[[tuple[float, float]], float]) -> Point:
+        return ds.fold(zeroValue, lambda pt1, pt2: Point(tuple(
             mapFunction(pair) for pair in zip(pt1.coordinates, pt2.coordinates)
-        ]))
+        )))
 
     @classmethod
     def generateTreeOfBoxes(
@@ -786,7 +793,7 @@ class PointIndexer:
         distanceMeasure: DistanceMeasure,
     ) -> RDD[tuple[PointSortKey, Point]]:
         numPartitions = data.getNumPartitions()
-        origin = Point([0.0] * dimensions.value)
+        origin = Point((0.0,) * dimensions.value)
 
         def f_mapPartitionsWithIndex(partitionIndex: int, points: Iterable[Point]) -> list[tuple[PointSortKey, Point]]:
             boxes_ = boxes.value
@@ -796,7 +803,9 @@ class PointIndexer:
                 pointIndex = pointIndexer.getNextIndex
                 box = next((b for b in boxes_ if b.isPointWithin(pt)), None)
                 distanceFromOrigin = distanceMeasure.compute(pt.coordinates, origin.coordinates)
-                boxId = box.boxId if box is not None else 0  # throw an exception if box is None?
+                if box is None:
+                    raise RuntimeError(f"Box for point {pt} was not found (metadata)")
+                boxId = box.boxId
                 newPoint = Point(
                     pt.coordinates,
                     pointIndex,
@@ -868,7 +877,7 @@ class DebugHelper:
     def justDo(cls, sc: SparkContext, fn: Callable[[], None]) -> None:
         opt = sc.getConf().get(cls.DebugOutputPath, None)
         if opt is not None:
-            fn(opt)
+            fn()
 
 
 class BoxTreeItemWithPoints(BoxTreeItemBase):
@@ -939,7 +948,7 @@ class PartitionIndex(DistanceCalculation):
         if child is not None:
             return self._findBoxForPoint(pt, child)
         else:
-            raise Exception(f"Box for point {pt} was not found")
+            raise RuntimeError(f"Box for point {pt} was not found")
 
     @classmethod
     def buildTree(
@@ -951,10 +960,10 @@ class PartitionIndex(DistanceCalculation):
         sortedBoxes = cls.generateAndSortBoxes(
             boundingBox, partitioningSettings.numberOfSplitsWithinPartition, dbscanSettings
         )
-        return cls._buildTreeRec(boundingBox, sortedBoxes)
+        return cls._buildTree(boundingBox, sortedBoxes)
 
     @classmethod
-    def _buildTreeRec(cls, boundingBox: Box, sortedBoxes: list[Box]) -> BoxTreeItemWithPoints:
+    def _buildTree(cls, boundingBox: Box, sortedBoxes: list[Box]) -> BoxTreeItemWithPoints:
         leafs = [BoxTreeItemWithPoints(b) for b in sortedBoxes]
 
         for leaf in leafs:
@@ -1069,14 +1078,7 @@ class AdjacentBoxesPartitioner:
         if isinstance(key, tuple) and len(key) == 2 and isinstance(key[0], BoxId) and isinstance(key[1], BoxId):
             return self.adjacentBoxIdPairs.index(key)
         else:
-            return 0  # Throw an exception?
-
-    def _generateBoxIdsToPartitionsMap(self, boxes: Sequence[Box]) -> dict[BoxId, int]:
-        return {box.boxId: box.partitionId for box in boxes}
-
-    @staticmethod
-    def assignPartitionIdsToBoxes(boxes: Sequence[Box]) -> tuple[Box, ...]:
-        return tuple(box.withPartitionId(i) for i, box in enumerate(boxes))
+            raise KeyError(f'Excepted key as tuple of two {BoxId} instances, got {type(key)}')
 
 
 class PointsInAdjacentBoxesRDD:
@@ -1116,20 +1118,25 @@ class DistanceAnalyzer(DistanceCalculation):
     def __init__(self, settings: Optional[DbscanSettings] = None, partitioningSettings: Optional[PartitioningSettings] = None) -> None:
         self.settings = DbscanSettings() if settings is None else settings
         self.partitioningSettings = PartitioningSettings() if partitioningSettings is None else partitioningSettings
-        self.distanceMeasure = settings.distanceMeasure
+        self.distanceMeasure = self.settings.distanceMeasure
 
     def countNeighborsForEachPoint(self, data: PointsPartitionedByBoxesRDD) -> RDD[tuple[PointSortKey, Point]]:
         closePointCounts = self.countClosePoints(data) \
-            .foldByKey(1, op_add) \
+            .reduceByKey(op_add) \
+            .mapValues(lambda count: (count + 1)) \
             .cache()
 
         pointsWithoutNeighbors = data.rdd.keys().subtract(closePointCounts.keys()).map(lambda x: (x, 1))
 
         allPointCounts = closePointCounts.union(pointsWithoutNeighbors)
+
+        closePointCounts.unpersist()
+        del closePointCounts
+
         partitioner = BoxPartitioner(data.boxes)
         partitionedAndSortedCounts = (
             allPointCounts
-            .repartitionAndSortWithinPartitions(partitioner.numPartitions, partitioner.getPartition)
+            .repartitionAndSortWithinPartitions(partitioner.numPartitions, partitioner.getPartition, ascending=True)
         )
 
         sortedData: RDD[tuple[PointSortKey, Point]] = data.rdd.mapPartitions(lambda it: sorted(it, key=lambda x: x[0]), preservesPartitioning=True)
@@ -1211,7 +1218,7 @@ class DistanceAnalyzer(DistanceCalculation):
         distanceMeasure = self.distanceMeasure
         f_calculatePointDistance = self.calculatePointDistance
 
-        def f_mapPartitions(it: Iterable[tuple[PairOfAdjacentBoxIds, Point]]) -> Iterable[tuple[PointSortKey, int]]:
+        def f_mapPartitions(idx: int, it: Iterable[tuple[PairOfAdjacentBoxIds, Point]]) -> Iterable[tuple[PointSortKey, int]]:
             pointsInPartition = sorted((pt[1] for pt in it), key=lambda pt: pt.distanceFromOrigin)
             counts: defaultdict[PointSortKey, int] = defaultdict(int)
 
@@ -1229,7 +1236,7 @@ class DistanceAnalyzer(DistanceCalculation):
 
             return counts.items()
 
-        return pointsInAdjacentBoxes.mapPartitions(f_mapPartitions)
+        return pointsInAdjacentBoxes.mapPartitionsWithIndex(f_mapPartitions)
 
     def findNeighborsOfNewPoint(self, clusteredAndNoisePoints: RDD[Point], newPoint: PointCoordinates) -> RDD[Point]:
         eps = self.settings.epsilon
@@ -1336,7 +1343,8 @@ class ArgsParser:
         # DBSCAN-specific arguments
         self._parser.add_argument('-e', '--eps', required=True, metavar='<eps>', type=float,
                                 help='Distance within which points are considered close enough to be assigned to one cluster')
-        self._parser.add_argument('--npp', metavar='<npp>', type=int, help='Number of points in partition')
+        self._parser.add_argument('--npp', metavar='<npp>', type=int, default=DbscanSettings.defaultNumberOfPoints,
+                                help=f'Number of points in partition (default: {DbscanSettings.defaultNumberOfPoints})')
         self._parser.add_argument('--numPts', required=True, metavar='<minPts>', type=int,
                                 help='Minimum number of points to form a cluster (minPts)')
         self._parser.add_argument('--borderPointsAsNoise', action='store_true',
@@ -1376,7 +1384,7 @@ class IOHelper:
     @classmethod
     def readDataset(cls, sc: SparkContext, path: str, minPartitions: Optional[int] = None) -> RawDataSet:
         rawData = sc.textFile(path, minPartitions=minPartitions)
-        return rawData.map(lambda line: Point(list(map(float, line.split(cls.separator)))))
+        return rawData.map(lambda line: Point(tuple(map(float, line.split(cls.separator)))))
 
     @classmethod
     def saveClusteringResult(cls, model: DbscanModel, outputPath: str) -> None:
@@ -1401,7 +1409,7 @@ class Dbscan(ABC):
         self.distanceAnalyzer = DistanceAnalyzer(settings)
 
     @abstractmethod
-    def run(data: RawDataSet) -> DbscanModel:
+    def run(self, data: RawDataSet) -> DbscanModel:
         raise NotImplementedError
 
 
@@ -1418,7 +1426,7 @@ class PartiallyMutablePoint(Point):
 
     @property
     def toImmutablePoint(self) -> Point:
-        return Point (
+        return Point(
             self.coordinates, self.pointId, self.boxId, self.distanceFromOrigin,
             self.precomputedNumberOfNeighbors, self.transientClusterId
         )
@@ -1490,6 +1498,8 @@ class DistributedDbscan(Dbscan, DistanceCalculation):
         completelyClusteredData = self._mergeClustersFromDifferentPartitions(
             partiallyClusteredData, partitionedData.boxes
         )
+
+        partiallyClusteredData.unpersist()
 
         return DbscanModel(completelyClusteredData, self.settings)
 
@@ -1621,6 +1631,7 @@ class DistributedDbscan(Dbscan, DistanceCalculation):
 
         pairwiseMappings = pointsInAdjacentBoxes.mapPartitions(_mapParitions_pairs)
 
+        borderPointsToBeAssignedToClusters: dict[PointId, ClusterId]
         if not settings.treatBorderPointsAsNoise:
             f_addBorderPointToCluster_2 = self._addBorderPointToCluster_2
 
@@ -1646,7 +1657,7 @@ class DistributedDbscan(Dbscan, DistanceCalculation):
 
             borderPointsToBeAssignedToClusters = pointsInAdjacentBoxes.mapPartitions(_mapParitions_borderPoints).collectAsMap()
         else:
-            borderPointsToBeAssignedToClusters: dict[PointId, ClusterId] = {}
+            borderPointsToBeAssignedToClusters = {}
 
         mappings: set[set[ClusterId]] = set()
         processedPairs: set[tuple[ClusterId, ClusterId]] = set()
