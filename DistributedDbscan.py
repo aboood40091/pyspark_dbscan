@@ -1601,7 +1601,7 @@ class DistributedDbscan(Dbscan, DistanceCalculation):
             subsetIndices = np.empty(sampleSize, dtype=np.int_)
 
             # Initialize the first center to index 0
-            centerId = 0
+            centerId: np.int_ = np.int_(0)
             subsetIndices[0] = centerId
 
             # Precompute squared norms of all points
