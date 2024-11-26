@@ -1474,7 +1474,7 @@ class PartiallyMutablePoint(Point):
     def toImmutablePoint(self) -> Point:
         return Point(
             self.coordinates, self.pointId, self.boxId, self.distanceFromOrigin,
-            self.precomputedNumberOfNeighbors, self.transientClusterId
+            self.precomputedNumberOfNeighbors, self.transientClusterId, self.isSampled
         )
 
 
